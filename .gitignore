@@ -1,0 +1,89 @@
+# Operating system files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Log and backup files
+*.log
+*.bak
+*.swp
+*.swo
+*.swn
+
+# Node.js dependencies
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Python dependencies
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.env
+
+# Java dependencies
+*.class
+*.jar
+*.war
+*.ear
+*.iml
+/.idea
+/.vscode
+
+# C/C++ dependencies
+*.o
+*.out
+*.a
+*.so
+*.exe
+
+# Go dependencies
+bin/
+obj/
+
+# Environment configuration files
+.env
+.env.local
+.env.development
+.env.production
+
+# PHP build files
+/vendor/
+
+# Ruby build files
+.bundle/
+log/
+tmp/
+
+# JavaScript build files
+/dist/
+/build/
+
+# Database files
+*.sqlite
+*.sqlite3
+*.db
+*.sql
+
+# IDE and editor configuration files
+/.idea/
+/.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# Docker and container files
+*.pid
+/tmp/
+
+# Git files
+.gitmodules
+.gitattributes
+
+# Other unwanted files
+*.tmp
+*.cache
+*.bak
+*.swp
+*.swo
+*.swn
