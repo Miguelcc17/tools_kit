@@ -133,6 +133,59 @@ class S3Manager:
             })
             raise S3OperationError(f"List operation failed: {e}") from e
 
+    def list_latest_files(
+        self, 
+        prefix: str = "",
+        max_files: int = 10,
+        descending: bool = True
+    ) -> List[Dict[str, Any]]:
+        """
+        Lists most recent files sorted by modification date
+
+        :param prefix: S3 prefix to filter files
+        :param max_files: Maximum number of files to return
+        :param descending: Descending order (newest first)
+        :return: List of sorted file metadata
+        :raises S3OperationError: If the operation fails
+        """
+        try:
+            all_objects = []
+            paginator = self.s3_client.get_paginator('list_objects_v2')
+            
+            for page in paginator.paginate(
+                Bucket=self.bucket_name,
+                Prefix=prefix
+            ):
+                if 'Contents' in page:
+                    # Filter files only (not folders)
+                    all_objects.extend([
+                        obj for obj in page['Contents']
+                        if not obj['Key'].endswith('/')
+                    ])
+
+            # Sort by modification date
+            sorted_objects = sorted(
+                all_objects,
+                key=lambda x: x['LastModified'],
+                reverse=descending
+            )[:max_files]
+
+            # Formatting results
+            return [{
+                'key': obj['Key'],
+                'size': obj['Size'],
+                'last_modified': obj['LastModified'].astimezone(timezone.utc),
+                'etag': obj['ETag'],
+                'storage_class': obj.get('StorageClass', 'STANDARD')
+            } for obj in sorted_objects]
+
+        except ClientError as e:
+            logger.error("Latest files listing failed: %s", e, exc_info=True, extra={
+                'bucket': self.bucket_name,
+                'prefix': prefix
+            })
+            raise S3OperationError(f"Latest files listing failed: {e}") from e
+
     def upload_fileobj(
         self,
         file_obj: BinaryIO,
@@ -214,7 +267,7 @@ class S3Manager:
     def generate_presigned_url(
         self,
         s3_key: str,
-        expiration: int = DEFAULT_SIGNED_URL_EXPIRATION,
+        expiration: int = SIGNED_URL_EXPIRATION,
         method: str = 'get_object'
     ) -> str:
         """
