@@ -1,7 +1,7 @@
 import os
 import logging
 from datetime import datetime, timezone
-from typing import Optional, Dict, List, BinaryIO, Any
+from typing import Optional, Dict, List, BinaryIO, Any, Union
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
 from boto3.s3.transfer import TransferConfig
@@ -88,21 +88,32 @@ class S3Manager:
             })
             raise S3ConfigurationError("Failed to initialize S3 client") from e
 
-
     def list_objects(
         self, 
         prefix: str = "",
-        max_items: Optional[int] = None
+        max_items: Optional[int] = None,
+        file_types: Optional[Union[List[str], str]] = None
     ) -> List[Dict[str, Any]]:
         """
         List objects in S3 bucket with pagination and filtering
         
         :param prefix: S3 key prefix to filter objects
         :param max_items: Maximum number of items to return
+        :param file_types: Optional list of file extensions (or a single extension as a string) 
+                           to filter by. Extensions are case-insensitive and can include or omit 
+                           the leading dot (e.g., 'txt', '.csv').
         :return: List of objects with metadata
         :raises S3OperationError: If operation fails
         """
         try:
+            # Process file_types to handle various input formats
+            file_types_lower = None
+            if file_types is not None:
+                if isinstance(file_types, str):
+                    file_types = [file_types]
+                # Remove leading dots and convert to lowercase
+                file_types_lower = [ext.lstrip('.').lower() for ext in file_types]
+
             paginator = self.s3_client.get_paginator('list_objects_v2')
             config = {'MaxItems': max_items} if max_items else {}
             
@@ -121,15 +132,24 @@ class S3Manager:
                         'storage_class': obj.get('StorageClass', 'STANDARD')
                     }
                     for obj in page.get('Contents', [])
+                    # Apply file type filter if specified
+                    if (file_types_lower is None) or (
+                        '.' in obj['Key'] and 
+                        obj['Key'].rsplit('.', 1)[1].lstrip('.').lower() in file_types_lower
+                    )
                 ])
             
-            logger.info("Listed %d objects from prefix: %s", len(results), prefix)
+            logger.info("Listed %d objects from prefix: %s%s", 
+                       len(results), 
+                       prefix, 
+                       f", file types: {file_types}" if file_types else "")
             return results
             
         except ClientError as e:
             logger.error("List objects failed: %s", e, exc_info=True, extra={
                 'bucket': self.bucket_name,
-                'prefix': prefix
+                'prefix': prefix,
+                'file_types': file_types
             })
             raise S3OperationError(f"List operation failed: {e}") from e
 
