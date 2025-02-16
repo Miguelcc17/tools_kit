@@ -157,18 +157,28 @@ class S3Manager:
         self, 
         prefix: str = "",
         max_files: int = 10,
-        descending: bool = True
+        descending: bool = True,
+        file_types: Optional[Union[List[str], str]] = None
     ) -> List[Dict[str, Any]]:
         """
-        Lists most recent files sorted by modification date
+        Lists most recent files sorted by modification date with optional type filtering
 
         :param prefix: S3 prefix to filter files
         :param max_files: Maximum number of files to return
         :param descending: Descending order (newest first)
+        :param file_types: Optional list/single file extension to filter 
+                         (e.g., ['txt', 'csv'] or 'pdf'). Case-insensitive.
         :return: List of sorted file metadata
         :raises S3OperationError: If the operation fails
         """
         try:
+            # Normalize file types
+            file_types_lower = None
+            if file_types is not None:
+                if isinstance(file_types, str):
+                    file_types = [file_types]
+                file_types_lower = [ext.lstrip('.').lower() for ext in file_types]
+
             all_objects = []
             paginator = self.s3_client.get_paginator('list_objects_v2')
             
@@ -177,10 +187,16 @@ class S3Manager:
                 Prefix=prefix
             ):
                 if 'Contents' in page:
-                    # Filter files only (not folders)
+                    # Combined filtering (folders and types)
                     all_objects.extend([
                         obj for obj in page['Contents']
-                        if not obj['Key'].endswith('/')
+                        if not obj['Key'].endswith('/') # Exclude folders
+                        and (file_types_lower is None or (
+                            ('.' in obj['Key'] and 
+                             obj['Key'].rsplit('.', 1)[1].lower() in file_types_lower)
+                            or ('.' not in obj['Key'] and 
+                                '' in file_types_lower)
+                        ))
                     ])
 
             # Sort by modification date
@@ -190,7 +206,7 @@ class S3Manager:
                 reverse=descending
             )[:max_files]
 
-            # Formatting results
+            # Format results
             return [{
                 'key': obj['Key'],
                 'size': obj['Size'],
@@ -202,7 +218,8 @@ class S3Manager:
         except ClientError as e:
             logger.error("Latest files listing failed: %s", e, exc_info=True, extra={
                 'bucket': self.bucket_name,
-                'prefix': prefix
+                'prefix': prefix,
+                'file_types': file_types
             })
             raise S3OperationError(f"Latest files listing failed: {e}") from e
 
