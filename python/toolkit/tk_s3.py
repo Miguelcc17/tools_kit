@@ -88,6 +88,49 @@ class S3Manager:
             })
             raise S3ConfigurationError("Failed to initialize S3 client") from e
 
+    def get_total_size(
+        self,
+        prefix: str = ""
+    ) -> int:
+        """
+        Calculate the total size of all objects in the bucket or under a specific prefix.
+
+        :param prefix: S3 prefix (folder path) to calculate the size. Defaults to the entire bucket.
+        :return: Total size in bytes.
+        :raises S3OperationError: If the operation fails.
+        """
+        try:
+            total_size = 0
+            paginator = self.s3_client.get_paginator('list_objects_v2')
+            
+            for page in paginator.paginate(
+                Bucket=self.bucket_name,
+                Prefix=prefix
+            ):
+                for obj in page.get('Contents', []):
+                    total_size += obj['Size']
+            
+            human_size = self._bytes_to_human(total_size)
+            logger.info(
+                "Total size for prefix '%s': %s (%d bytes)",
+                prefix if prefix else 'root',
+                human_size,
+                total_size
+            )
+            return total_size
+            
+        except ClientError as e:
+            logger.error(
+                "Error calculating total size: %s",
+                e,
+                exc_info=True,
+                extra={
+                    'bucket': self.bucket_name,
+                    'prefix': prefix
+                }
+            )
+            raise S3OperationError(f"Error calculating size: {e}") from e
+
     def list_objects(
         self, 
         prefix: str = "",
@@ -277,6 +320,7 @@ class S3Manager:
             })
             raise S3OperationError(f"Error listando carpetas: {e}") from e
 
+
     def upload_fileobj(
         self,
         file_obj: BinaryIO,
@@ -409,3 +453,14 @@ class S3Manager:
             
         clean_components = [c for c in components if c]
         return f"{'/'.join(clean_components)}{ext}".lstrip('/')
+
+    @staticmethod
+    def _bytes_to_human(size_bytes: int) -> str:
+        """
+        Convert bytes to human-readable format (KB, MB, GB, TB)
+        """
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+            if size_bytes < 1024:
+                return f"{size_bytes:.2f} {unit}"
+            size_bytes /= 1024
+        return f"{size_bytes:.2f} PB"
