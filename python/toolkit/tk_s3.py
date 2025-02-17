@@ -338,6 +338,49 @@ class S3Manager:
             })
             raise S3OperationError(f"Error listando carpetas: {e}") from e
 
+    def get_file_in_memory(
+            self, 
+            key: str,
+            version_id: Optional[str] = None,
+            decode: bool = False,
+            encoding: str = 'utf-8'
+        ) -> Union[bytes, str]:
+        """
+        Load a file from S3 directly into memory
+
+        :param key: S3 key of the file
+        :param version_id: Specific version of the object (optional)
+        :param decode: Decode the content to string
+        :param encoding: Encoding to decode (default: utf-8)
+        :return: File content as bytes or string
+        :raises S3OperationError: If the file does not exist or download fails
+        """
+        try:
+            params = {
+                'Bucket': self.bucket_name,
+                'Key': key
+            }
+            if version_id:
+                params['VersionId'] = version_id
+
+            response = self.s3_client.get_object(**params)
+            content = response['Body'].read()
+
+            if decode:
+                return content.decode(encoding)
+                
+            logger.info("File loaded into memory: %s (%d bytes)", 
+                    key, len(content))
+            return content
+
+        except ClientError as e:
+            error_code = e.response.get('Error', {}).get('Code', '')
+            if error_code == 'NoSuchKey':
+                logger.error("File not found: %s", key)
+                raise S3OperationError(f"File does not exist: {key}") from e
+            logger.error("Error loading file: %s", e, exc_info=True)
+            raise S3OperationError(f"Error loading file: {e}") from e
+
     def upload_fileobj(
         self,
         file_obj: BinaryIO,
