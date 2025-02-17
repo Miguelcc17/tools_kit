@@ -1,6 +1,7 @@
 import os
 import logging
 from datetime import datetime, timezone
+import time
 from typing import Optional, Dict, List, BinaryIO, Any, Union
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
@@ -376,6 +377,127 @@ class S3Manager:
         except (ClientError, BotoCoreError) as e:
             logger.error("Upload failed for key: %s - %s", s3_key, e, exc_info=True)
             raise S3OperationError(f"Upload failed: {e}") from e
+
+    def download(
+        self,
+        s3_target: str,
+        local_path: str,
+        overwrite: bool = False
+    ) -> Dict[str, Union[int, float]]:
+        """
+        Download a file or entire directory from S3
+
+        :param s3_target: S3 path (file or directory prefix)
+        :param local_path: Local destination path
+        :param overwrite: Overwrite existing files
+        :return: Dict with download statistics
+        :raises S3OperationError: If the operation fails
+        """
+        try:
+            total_files = 0
+            total_size = 0
+            start_time = time.time()
+
+            # Determine if it is a file or directory
+            is_directory = s3_target.endswith('/') or not self._s3_object_exists(s3_target)
+
+            if is_directory:
+                if os.path.exists(local_path):
+                    if not os.path.isdir(local_path):
+                        raise ValueError(f"The local path exists and is not a directory: {local_path}")
+                else:
+                    os.makedirs(local_path, exist_ok=True)
+
+                # Download entire directory
+                objects = self.list_objects(prefix=s3_target)
+                if not objects:
+                    raise S3OperationError(f"Empty directory or does not exist: {s3_target}")
+
+                for obj in objects:
+                    relative_path = os.path.relpath(obj['key'], s3_target)
+                    dest_path = os.path.join(local_path, relative_path)
+                    print(dest_path)
+
+                    if os.path.exists(dest_path) and os.path.isdir(dest_path):
+                        raise IsADirectoryError(
+                        f"Cannot overwrite directory with file: {dest_path}"
+                    )
+
+                    self._download_single_file(obj['key'], dest_path, overwrite)
+                    total_files += 1
+                    total_size += obj['size']
+
+            else:
+                if os.path.isdir(local_path):
+                    filename = os.path.basename(s3_target)
+                    dest_path = os.path.join(local_path, filename)
+                else:
+                    dest_path = local_path
+
+                # Download individual file
+                self._download_single_file(s3_target, dest_path, overwrite)
+                total_files = 1
+                total_size = self._get_object_size(s3_target)
+
+            elapsed = time.time() - start_time
+            logger.info(
+                "Download completed: %d files (%s) in %.1fs",
+                total_files,
+                self._bytes_to_human(total_size),
+                elapsed
+            )
+
+            return {
+                'total_files': total_files,
+                'total_bytes': total_size,
+                'time_sec': round(elapsed, 1),
+                'avg_speed': total_size / elapsed if elapsed > 0 else 0
+            }
+
+        except ClientError as e:
+            logger.error("Download error: %s", e, exc_info=True, extra={
+                's3_target': s3_target,
+                'local_path': local_path
+            })
+            raise S3OperationError(f"Download error: {e}") from e
+
+    def _download_single_file(self, s3_key: str, local_path: str, overwrite: bool):
+        """Download an individual file"""
+        dest_dir = os.path.dirname(local_path)
+
+        if os.path.exists(dest_dir) and not os.path.isdir(dest_dir):
+            raise NotADirectoryError(
+            f"Cannot create directory '{dest_dir}' because a file with that name already exists"
+        )
+        os.makedirs(dest_dir, exist_ok=True)
+
+        if os.path.exists(local_path):
+            if os.path.isdir(local_path):
+                raise IsADirectoryError(f"The destination path is a directory: {local_path}")
+            if not overwrite:
+                raise FileExistsError(f"File already exists: {local_path}")
+
+        self.s3_client.download_file(
+            Bucket=self.bucket_name,
+            Key=s3_key,
+            Filename=local_path
+        )
+        logger.debug("Downloaded: %s -> %s", s3_key, local_path)
+
+    def _s3_object_exists(self, key: str) -> bool:
+        """Check if an object exists"""
+        try:
+            self.s3_client.head_object(Bucket=self.bucket_name, Key=key)
+            return True
+        except ClientError as e:
+            if e.response['Error']['Code'] == '404':
+                return False
+            raise
+
+    def _get_object_size(self, key: str) -> int:
+        """Get the size of an individual object"""
+        response = self.s3_client.head_object(Bucket=self.bucket_name, Key=key)
+        return response['ContentLength']
 
     def _build_upload_args(
         self,
