@@ -223,6 +223,62 @@ class S3Manager:
             })
             raise S3OperationError(f"Latest files listing failed: {e}") from e
 
+    def list_folders(
+        self,
+        prefix: str = ""
+    ) -> List[str]:
+        """
+        Lista todas las carpetas y subcarpetas bajo un prefijo específico en S3.
+
+        :param prefix: Prefijo S3 desde donde empezar a listar (por defecto: raíz)
+        :return: Lista ordenada de rutas de carpetas
+        :raises S3OperationError: Si falla la operación
+        """
+        try:
+            # Normalizar el prefijo para asegurar que termine en '/' si no está vacío
+            normalized_prefix = prefix
+            if normalized_prefix and not normalized_prefix.endswith('/'):
+                normalized_prefix += '/'
+            
+            folders = set()
+            paginator = self.s3_client.get_paginator('list_objects_v2')
+            
+            # Listar todos los objetos bajo el prefijo
+            for page in paginator.paginate(
+                Bucket=self.bucket_name,
+                Prefix=normalized_prefix
+            ):
+                for obj in page.get('Contents', []):
+                    key = obj['Key']
+                    # Generar todas las carpetas padre para la clave
+                    parts = key.split('/')
+                    current_folder = ''
+                    for part in parts[:-1]:  # Excluir el último elemento (archivo o cadena vacía)
+                        if part:
+                            current_folder += part + '/'
+                        # Verificar si la carpeta está bajo el prefijo normalizado
+                        if current_folder.startswith(normalized_prefix):
+                            folders.add(current_folder)
+            
+            # Remover el prefijo normalizado si está presente
+            if normalized_prefix:
+                folders.discard(normalized_prefix)
+            
+            # Ordenar y retornar
+            sorted_folders = sorted(folders)
+            
+            logger.info("Listadas %d carpetas bajo el prefijo: %s", 
+                    len(sorted_folders), 
+                    normalized_prefix or 'raíz')
+            return sorted_folders
+            
+        except ClientError as e:
+            logger.error("Error listando carpetas: %s", e, exc_info=True, extra={
+                'bucket': self.bucket_name,
+                'prefix': prefix
+            })
+            raise S3OperationError(f"Error listando carpetas: {e}") from e
+
     def upload_fileobj(
         self,
         file_obj: BinaryIO,
