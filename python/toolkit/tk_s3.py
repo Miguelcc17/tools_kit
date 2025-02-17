@@ -228,45 +228,43 @@ class S3Manager:
         prefix: str = ""
     ) -> List[str]:
         """
-        Lista todas las carpetas y subcarpetas bajo un prefijo específico en S3.
+        List all folders and subfolders under a specific prefix in S3.
 
-        :param prefix: Prefijo S3 desde donde empezar a listar (por defecto: raíz)
-        :return: Lista ordenada de rutas de carpetas
-        :raises S3OperationError: Si falla la operación
+        :param prefix: S3 prefix to start listing from (default: root)
+        :return: Sorted list of folder paths
+        :raises S3OperationError: If the operation fails
         """
         try:
-            # Normalizar el prefijo para asegurar que termine en '/' si no está vacío
+            # Normalize the prefix to ensure it ends with '/' if not empty
             normalized_prefix = prefix
             if normalized_prefix and not normalized_prefix.endswith('/'):
                 normalized_prefix += '/'
             
             folders = set()
             paginator = self.s3_client.get_paginator('list_objects_v2')
-            
-            # Listar todos los objetos bajo el prefijo
+            # List all objects under the prefix
             for page in paginator.paginate(
                 Bucket=self.bucket_name,
                 Prefix=normalized_prefix
             ):
                 for obj in page.get('Contents', []):
                     key = obj['Key']
-                    # Generar todas las carpetas padre para la clave
+                    # Generate all parent folders for the key
                     parts = key.split('/')
                     current_folder = ''
-                    for part in parts[:-1]:  # Excluir el último elemento (archivo o cadena vacía)
+                    for part in parts[:-1]:  # Exclude the last element (file or empty string)
                         if part:
                             current_folder += part + '/'
-                        # Verificar si la carpeta está bajo el prefijo normalizado
+                        # Check if the folder is under the normalized prefix
                         if current_folder.startswith(normalized_prefix):
                             folders.add(current_folder)
             
-            # Remover el prefijo normalizado si está presente
+            # Remove the normalized prefix if present
             if normalized_prefix:
                 folders.discard(normalized_prefix)
             
-            # Ordenar y retornar
+            # Sort and return
             sorted_folders = sorted(folders)
-            
             logger.info("Listadas %d carpetas bajo el prefijo: %s", 
                     len(sorted_folders), 
                     normalized_prefix or 'raíz')
