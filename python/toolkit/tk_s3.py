@@ -136,7 +136,8 @@ class S3Manager:
         self, 
         prefix: str = "",
         max_items: Optional[int] = None,
-        file_types: Optional[Union[List[str], str]] = None
+        file_types: Optional[Union[List[str], str]] = None,
+        exclude_directories: bool = True
     ) -> List[Dict[str, Any]]:
         """
         List objects in S3 bucket with pagination and filtering
@@ -152,42 +153,58 @@ class S3Manager:
         try:
             # Process file_types to handle various input formats
             file_types_lower = None
-            if file_types is not None:
-                if isinstance(file_types, str):
-                    file_types = [file_types]
-                # Remove leading dots and convert to lowercase
-                file_types_lower = [ext.lstrip('.').lower() for ext in file_types]
+            if file_types:
+                file_types = [file_types] if isinstance(file_types, str) else file_types
+                file_types_lower = {ext.lstrip('.').lower() for ext in file_types}
 
             paginator = self.s3_client.get_paginator('list_objects_v2')
-            config = {'MaxItems': max_items} if max_items else {}
-            
             results = []
-            for page in paginator.paginate(
+            remaining = max_items if max_items is not None else float('inf')
+            
+
+            page_iterator = paginator.paginate(
                 Bucket=self.bucket_name,
                 Prefix=prefix,
-                PaginationConfig=config
-            ):
-                results.extend([
-                    {
-                        'key': obj['Key'],
+                PaginationConfig={'MaxItems': max_items * 2} if max_items else {}
+            )
+
+            for page in page_iterator:
+                for obj in page.get('Contents', []):
+                    if remaining <= 0:
+                        break
+                        
+                    # Apply filters
+                    key = obj['Key']
+                    if exclude_directories and key.endswith('/'):
+                        continue
+                        
+                    if file_types_lower:
+                        if '.' not in key:
+                            continue
+                        ext = key.rsplit('.', 1)[1].lstrip('.').lower()
+                        if ext not in file_types_lower:
+                            continue
+
+                    # Add valid object
+                    results.append({
+                        'key': key,
                         'size': obj['Size'],
                         'last_modified': obj['LastModified'].astimezone(timezone.utc),
                         'etag': obj['ETag'],
                         'storage_class': obj.get('StorageClass', 'STANDARD')
-                    }
-                    for obj in page.get('Contents', [])
-                    # Apply file type filter if specified
-                    if (file_types_lower is None) or (
-                        '.' in obj['Key'] and 
-                        obj['Key'].rsplit('.', 1)[1].lstrip('.').lower() in file_types_lower
-                    )
-                ])
-            
+                    })
+                    remaining -= 1
+
+                if remaining <= 0:
+                    break
+
+            final_results = results[:max_items] if max_items else results
+
             logger.info("Listed %d objects from prefix: %s%s", 
                        len(results), 
                        prefix, 
                        f", file types: {file_types}" if file_types else "")
-            return results
+            return final_results
             
         except ClientError as e:
             logger.error("List objects failed: %s", e, exc_info=True, extra={
@@ -321,7 +338,6 @@ class S3Manager:
             })
             raise S3OperationError(f"Error listando carpetas: {e}") from e
 
-
     def upload_fileobj(
         self,
         file_obj: BinaryIO,
@@ -423,7 +439,7 @@ class S3Manager:
                         f"Cannot overwrite directory with file: {dest_path}"
                     )
 
-                    self._download_single_file(obj['key'], dest_path, overwrite)
+                    # self._download_single_file(obj['key'], dest_path, overwrite)
                     total_files += 1
                     total_size += obj['size']
 
