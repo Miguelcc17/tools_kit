@@ -1,7 +1,8 @@
 import os
 import logging
 from datetime import datetime, timezone
-from typing import Optional, Dict, List, BinaryIO, Any
+import time
+from typing import Optional, Dict, List, BinaryIO, Any, Union
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
 from boto3.s3.transfer import TransferConfig
@@ -88,48 +89,128 @@ class S3Manager:
             })
             raise S3ConfigurationError("Failed to initialize S3 client") from e
 
+    def get_total_size(
+            self,
+            prefix: str = ""
+        ) -> int:
+        """
+        Calculate the total size of all objects in the bucket or under a specific prefix.
+
+        :param prefix: S3 prefix (folder path) to calculate the size. Defaults to the entire bucket.
+        :return: Total size in bytes.
+        :raises S3OperationError: If the operation fails.
+        """
+        try:
+            total_size = 0
+            paginator = self.s3_client.get_paginator('list_objects_v2')
+            
+            for page in paginator.paginate(
+                Bucket=self.bucket_name,
+                Prefix=prefix
+            ):
+                for obj in page.get('Contents', []):
+                    total_size += obj['Size']
+            
+            human_size = self._bytes_to_human(total_size)
+            logger.info(
+                "Total size for prefix '%s': %s (%d bytes)",
+                prefix if prefix else 'root',
+                human_size,
+                total_size
+            )
+            return total_size
+            
+        except ClientError as e:
+            logger.error(
+                "Error calculating total size: %s",
+                e,
+                exc_info=True,
+                extra={
+                    'bucket': self.bucket_name,
+                    'prefix': prefix
+                }
+            )
+            raise S3OperationError(f"Error calculating size: {e}") from e
 
     def list_objects(
         self, 
         prefix: str = "",
-        max_items: Optional[int] = None
+        max_items: Optional[int] = None,
+        file_types: Optional[Union[List[str], str]] = None,
+        exclude_directories: bool = True
     ) -> List[Dict[str, Any]]:
         """
         List objects in S3 bucket with pagination and filtering
         
         :param prefix: S3 key prefix to filter objects
         :param max_items: Maximum number of items to return
+        :param file_types: Optional list of file extensions (or a single extension as a string) 
+                           to filter by. Extensions are case-insensitive and can include or omit 
+                           the leading dot (e.g., 'txt', '.csv').
         :return: List of objects with metadata
         :raises S3OperationError: If operation fails
         """
         try:
+            # Process file_types to handle various input formats
+            file_types_lower = None
+            if file_types:
+                file_types = [file_types] if isinstance(file_types, str) else file_types
+                file_types_lower = {ext.lstrip('.').lower() for ext in file_types}
+
             paginator = self.s3_client.get_paginator('list_objects_v2')
-            config = {'MaxItems': max_items} if max_items else {}
-            
             results = []
-            for page in paginator.paginate(
+            remaining = max_items if max_items is not None else float('inf')
+            
+
+            page_iterator = paginator.paginate(
                 Bucket=self.bucket_name,
                 Prefix=prefix,
-                PaginationConfig=config
-            ):
-                results.extend([
-                    {
-                        'key': obj['Key'],
+                PaginationConfig={'MaxItems': max_items * 2} if max_items else {}
+            )
+
+            for page in page_iterator:
+                for obj in page.get('Contents', []):
+                    if remaining <= 0:
+                        break
+                        
+                    # Apply filters
+                    key = obj['Key']
+                    if exclude_directories and key.endswith('/'):
+                        continue
+                        
+                    if file_types_lower:
+                        if '.' not in key:
+                            continue
+                        ext = key.rsplit('.', 1)[1].lstrip('.').lower()
+                        if ext not in file_types_lower:
+                            continue
+
+                    # Add valid object
+                    results.append({
+                        'key': key,
                         'size': obj['Size'],
                         'last_modified': obj['LastModified'].astimezone(timezone.utc),
                         'etag': obj['ETag'],
                         'storage_class': obj.get('StorageClass', 'STANDARD')
-                    }
-                    for obj in page.get('Contents', [])
-                ])
-            
-            logger.info("Listed %d objects from prefix: %s", len(results), prefix)
-            return results
+                    })
+                    remaining -= 1
+
+                if remaining <= 0:
+                    break
+
+            final_results = results[:max_items] if max_items else results
+
+            logger.info("Listed %d objects from prefix: %s%s", 
+                       len(results), 
+                       prefix, 
+                       f", file types: {file_types}" if file_types else "")
+            return final_results
             
         except ClientError as e:
             logger.error("List objects failed: %s", e, exc_info=True, extra={
                 'bucket': self.bucket_name,
-                'prefix': prefix
+                'prefix': prefix,
+                'file_types': file_types
             })
             raise S3OperationError(f"List operation failed: {e}") from e
 
@@ -137,18 +218,28 @@ class S3Manager:
         self, 
         prefix: str = "",
         max_files: int = 10,
-        descending: bool = True
+        descending: bool = True,
+        file_types: Optional[Union[List[str], str]] = None
     ) -> List[Dict[str, Any]]:
         """
-        Lists most recent files sorted by modification date
+        Lists most recent files sorted by modification date with optional type filtering
 
         :param prefix: S3 prefix to filter files
         :param max_files: Maximum number of files to return
         :param descending: Descending order (newest first)
+        :param file_types: Optional list/single file extension to filter 
+                         (e.g., ['txt', 'csv'] or 'pdf'). Case-insensitive.
         :return: List of sorted file metadata
         :raises S3OperationError: If the operation fails
         """
         try:
+            # Normalize file types
+            file_types_lower = None
+            if file_types is not None:
+                if isinstance(file_types, str):
+                    file_types = [file_types]
+                file_types_lower = [ext.lstrip('.').lower() for ext in file_types]
+
             all_objects = []
             paginator = self.s3_client.get_paginator('list_objects_v2')
             
@@ -157,10 +248,16 @@ class S3Manager:
                 Prefix=prefix
             ):
                 if 'Contents' in page:
-                    # Filter files only (not folders)
+                    # Combined filtering (folders and types)
                     all_objects.extend([
                         obj for obj in page['Contents']
-                        if not obj['Key'].endswith('/')
+                        if not obj['Key'].endswith('/') # Exclude folders
+                        and (file_types_lower is None or (
+                            ('.' in obj['Key'] and 
+                             obj['Key'].rsplit('.', 1)[1].lower() in file_types_lower)
+                            or ('.' not in obj['Key'] and 
+                                '' in file_types_lower)
+                        ))
                     ])
 
             # Sort by modification date
@@ -170,7 +267,7 @@ class S3Manager:
                 reverse=descending
             )[:max_files]
 
-            # Formatting results
+            # Format results
             return [{
                 'key': obj['Key'],
                 'size': obj['Size'],
@@ -182,9 +279,107 @@ class S3Manager:
         except ClientError as e:
             logger.error("Latest files listing failed: %s", e, exc_info=True, extra={
                 'bucket': self.bucket_name,
-                'prefix': prefix
+                'prefix': prefix,
+                'file_types': file_types
             })
             raise S3OperationError(f"Latest files listing failed: {e}") from e
+
+    def list_folders(
+        self,
+        prefix: str = ""
+    ) -> List[str]:
+        """
+        List all folders and subfolders under a specific prefix in S3.
+
+        :param prefix: S3 prefix to start listing from (default: root)
+        :return: Sorted list of folder paths
+        :raises S3OperationError: If the operation fails
+        """
+        try:
+            # Normalize the prefix to ensure it ends with '/' if not empty
+            normalized_prefix = prefix
+            if normalized_prefix and not normalized_prefix.endswith('/'):
+                normalized_prefix += '/'
+            
+            folders = set()
+            paginator = self.s3_client.get_paginator('list_objects_v2')
+            # List all objects under the prefix
+            for page in paginator.paginate(
+                Bucket=self.bucket_name,
+                Prefix=normalized_prefix
+            ):
+                for obj in page.get('Contents', []):
+                    key = obj['Key']
+                    # Generate all parent folders for the key
+                    parts = key.split('/')
+                    current_folder = ''
+                    for part in parts[:-1]:  # Exclude the last element (file or empty string)
+                        if part:
+                            current_folder += part + '/'
+                        # Check if the folder is under the normalized prefix
+                        if current_folder.startswith(normalized_prefix):
+                            folders.add(current_folder)
+            
+            # Remove the normalized prefix if present
+            if normalized_prefix:
+                folders.discard(normalized_prefix)
+            
+            # Sort and return
+            sorted_folders = sorted(folders)
+            logger.info("Listadas %d carpetas bajo el prefijo: %s", 
+                    len(sorted_folders), 
+                    normalized_prefix or 'raíz')
+            return sorted_folders
+            
+        except ClientError as e:
+            logger.error("Error listando carpetas: %s", e, exc_info=True, extra={
+                'bucket': self.bucket_name,
+                'prefix': prefix
+            })
+            raise S3OperationError(f"Error listando carpetas: {e}") from e
+
+    def get_file_in_memory(
+            self, 
+            key: str,
+            version_id: Optional[str] = None,
+            decode: bool = False,
+            encoding: str = 'utf-8'
+        ) -> Union[bytes, str]:
+        """
+        Load a file from S3 directly into memory
+
+        :param key: S3 key of the file
+        :param version_id: Specific version of the object (optional)
+        :param decode: Decode the content to string
+        :param encoding: Encoding to decode (default: utf-8)
+        :return: File content as bytes or string
+        :raises S3OperationError: If the file does not exist or download fails
+        """
+        try:
+            params = {
+                'Bucket': self.bucket_name,
+                'Key': key
+            }
+            if version_id:
+                params['VersionId'] = version_id
+
+            response = self.s3_client.get_object(**params)
+            content = response['Body'].read()
+
+            if decode:
+                return content.decode(encoding)
+                
+            logger.info("File loaded into memory: %s (%d bytes)", 
+                    key, len(content))
+            return content
+
+        except ClientError as e:
+            error_code = e.response.get('Error', {}).get('Code', '')
+            if error_code == 'NoSuchKey':
+                logger.error("File not found: %s", key)
+                raise S3OperationError(f"File does not exist: {key}") from e
+            logger.error("Error loading file: %s", e, exc_info=True)
+            raise S3OperationError(f"Error loading file: {e}") from e
 
     def upload_fileobj(
         self,
@@ -241,6 +436,227 @@ class S3Manager:
         except (ClientError, BotoCoreError) as e:
             logger.error("Upload failed for key: %s - %s", s3_key, e, exc_info=True)
             raise S3OperationError(f"Upload failed: {e}") from e
+
+    def upload_directory(
+        self,
+        directory_path: str,
+        s3_prefix: str,
+        metadata: Optional[Dict[str, str]] = None,
+        content_type: Optional[str] = None,
+        public_read: bool = False
+    ) -> Dict[str, Any]:
+        """
+        Upload a directory to S3 recursively
+        
+        :param directory_path: Path to the local directory to upload
+        :param s3_prefix: S3 prefix (folder) where the directory contents will be uploaded
+        :param metadata: Optional object metadata
+        :param content_type: Content MIME type
+        :param public_read: Enable public read access
+        :return: Dictionary with upload results for each file
+        :raises S3OperationError: If upload fails for any file
+        """
+        upload_results = {}
+        
+        for root, dirs, files in os.walk(directory_path):
+            for file_name in files:
+                local_file_path = os.path.join(root, file_name)
+                
+                # Construct the S3 key by joining the prefix and the relative path
+                relative_path = os.path.relpath(local_file_path, directory_path)
+                s3_key = os.path.join(s3_prefix, relative_path).replace("\\", "/")
+                
+                try:
+                    with open(local_file_path, 'rb') as file_obj:
+                        result = self.upload_fileobj(
+                            file_obj=file_obj,
+                            s3_key=s3_key,
+                            metadata=metadata,
+                            content_type=content_type,
+                            public_read=public_read
+                        )
+                        upload_results[local_file_path] = result
+                except S3OperationError as e:
+                    logger.error("Failed to upload file: %s - %s", local_file_path, e)
+                    upload_results[local_file_path] = {'error': str(e)}
+        
+        return upload_results
+
+    def download(
+        self,
+        s3_target: str,
+        local_path: str,
+        overwrite: bool = False
+    ) -> Dict[str, Union[int, float]]:
+        """
+        Download a file or entire directory from S3
+
+        :param s3_target: S3 path (file or directory prefix)
+        :param local_path: Local destination path
+        :param overwrite: Overwrite existing files
+        :return: Dict with download statistics
+        :raises S3OperationError: If the operation fails
+        """
+        try:
+            total_files = 0
+            total_size = 0
+            start_time = time.time()
+
+            # Determine if it is a file or directory
+            is_directory = s3_target.endswith('/') or not self._s3_object_exists(s3_target)
+
+            if is_directory:
+                if os.path.exists(local_path):
+                    if not os.path.isdir(local_path):
+                        raise ValueError(f"The local path exists and is not a directory: {local_path}")
+                else:
+                    os.makedirs(local_path, exist_ok=True)
+
+                # Download entire directory
+                objects = self.list_objects(prefix=s3_target)
+                if not objects:
+                    raise S3OperationError(f"Empty directory or does not exist: {s3_target}")
+
+                for obj in objects:
+                    relative_path = os.path.relpath(obj['key'], s3_target)
+                    dest_path = os.path.join(local_path, relative_path)
+                    print(dest_path)
+
+                    if os.path.exists(dest_path) and os.path.isdir(dest_path):
+                        raise IsADirectoryError(
+                        f"Cannot overwrite directory with file: {dest_path}"
+                    )
+
+                    # self._download_single_file(obj['key'], dest_path, overwrite)
+                    total_files += 1
+                    total_size += obj['size']
+
+            else:
+                if os.path.isdir(local_path):
+                    filename = os.path.basename(s3_target)
+                    dest_path = os.path.join(local_path, filename)
+                else:
+                    dest_path = local_path
+
+                # Download individual file
+                self._download_single_file(s3_target, dest_path, overwrite)
+                total_files = 1
+                total_size = self._get_object_size(s3_target)
+
+            elapsed = time.time() - start_time
+            logger.info(
+                "Download completed: %d files (%s) in %.1fs",
+                total_files,
+                self._bytes_to_human(total_size),
+                elapsed
+            )
+
+            return {
+                'total_files': total_files,
+                'total_bytes': total_size,
+                'time_sec': round(elapsed, 1),
+                'avg_speed': total_size / elapsed if elapsed > 0 else 0
+            }
+
+        except ClientError as e:
+            logger.error("Download error: %s", e, exc_info=True, extra={
+                's3_target': s3_target,
+                'local_path': local_path
+            })
+            raise S3OperationError(f"Download error: {e}") from e
+
+    def delete_file(self, s3_key: str) -> Dict[str, Any]:
+        """
+        Delete a single file/object from S3
+        
+        :param s3_key: Full S3 key/path of the object to delete
+        :return: Response from S3 delete operation
+        :raises S3OperationError: If deletion fails
+        """
+        try:
+            response = self.s3_client.delete_object(
+                Bucket=self.bucket_name,
+                Key=s3_key
+            )
+            logger.info("Successfully deleted: %s", s3_key)
+            return response
+        except (ClientError, BotoCoreError) as e:
+            logger.error("Deletion failed for key: %s - %s", s3_key, e, exc_info=True)
+            raise S3OperationError(f"Deletion failed: {e}") from e
+
+    def delete_directory(self, s3_prefix: str) -> Dict[str, Any]:
+        """
+        Delete a directory (prefix) and all its contents from S3
+        
+        :param s3_prefix: S3 prefix (folder) to delete
+        :return: Summary of deletion results
+        :raises S3OperationError: If deletion fails
+        """
+        try:
+            # List all objects under the prefix
+            objects_to_delete = []
+            paginator = self.s3_client.get_paginator('list_objects_v2')
+            for page in paginator.paginate(Bucket=self.bucket_name, Prefix=s3_prefix):
+                if 'Contents' in page:
+                    for obj in page['Contents']:
+                        objects_to_delete.append({'Key': obj['Key']})
+            
+            if not objects_to_delete:
+                logger.info("No objects found under prefix: %s", s3_prefix)
+                return {'message': 'No objects found to delete'}
+            
+            # Delete all objects in bulk
+            response = self.s3_client.delete_objects(
+                Bucket=self.bucket_name,
+                Delete={'Objects': objects_to_delete}
+            )
+            
+            logger.info("Successfully deleted %d objects under prefix: %s", 
+                    len(objects_to_delete), s3_prefix)
+            return {
+                'deleted_objects': [obj['Key'] for obj in objects_to_delete],
+                'response': response
+            }
+        except (ClientError, BotoCoreError) as e:
+            logger.error("Deletion failed for prefix: %s - %s", s3_prefix, e, exc_info=True)
+            raise S3OperationError(f"Deletion failed: {e}") from e
+    def _download_single_file(self, s3_key: str, local_path: str, overwrite: bool):
+        """Download an individual file"""
+        dest_dir = os.path.dirname(local_path)
+
+        if os.path.exists(dest_dir) and not os.path.isdir(dest_dir):
+            raise NotADirectoryError(
+            f"Cannot create directory '{dest_dir}' because a file with that name already exists"
+        )
+        os.makedirs(dest_dir, exist_ok=True)
+
+        if os.path.exists(local_path):
+            if os.path.isdir(local_path):
+                raise IsADirectoryError(f"The destination path is a directory: {local_path}")
+            if not overwrite:
+                raise FileExistsError(f"File already exists: {local_path}")
+
+        self.s3_client.download_file(
+            Bucket=self.bucket_name,
+            Key=s3_key,
+            Filename=local_path
+        )
+        logger.debug("Downloaded: %s -> %s", s3_key, local_path)
+
+    def _s3_object_exists(self, key: str) -> bool:
+        """Check if an object exists"""
+        try:
+            self.s3_client.head_object(Bucket=self.bucket_name, Key=key)
+            return True
+        except ClientError as e:
+            if e.response['Error']['Code'] == '404':
+                return False
+            raise
+
+    def _get_object_size(self, key: str) -> int:
+        """Get the size of an individual object"""
+        response = self.s3_client.head_object(Bucket=self.bucket_name, Key=key)
+        return response['ContentLength']
 
     def _build_upload_args(
         self,
@@ -318,3 +734,14 @@ class S3Manager:
             
         clean_components = [c for c in components if c]
         return f"{'/'.join(clean_components)}{ext}".lstrip('/')
+
+    @staticmethod
+    def _bytes_to_human(size_bytes: int) -> str:
+        """
+        Convert bytes to human-readable format (KB, MB, GB, TB)
+        """
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+            if size_bytes < 1024:
+                return f"{size_bytes:.2f} {unit}"
+            size_bytes /= 1024
+        return f"{size_bytes:.2f} PB"
