@@ -584,6 +584,42 @@ class S3Manager:
             logger.error("Deletion failed for key: %s - %s", s3_key, e, exc_info=True)
             raise S3OperationError(f"Deletion failed: {e}") from e
 
+    def delete_directory(self, s3_prefix: str) -> Dict[str, Any]:
+        """
+        Delete a directory (prefix) and all its contents from S3
+        
+        :param s3_prefix: S3 prefix (folder) to delete
+        :return: Summary of deletion results
+        :raises S3OperationError: If deletion fails
+        """
+        try:
+            # List all objects under the prefix
+            objects_to_delete = []
+            paginator = self.s3_client.get_paginator('list_objects_v2')
+            for page in paginator.paginate(Bucket=self.bucket_name, Prefix=s3_prefix):
+                if 'Contents' in page:
+                    for obj in page['Contents']:
+                        objects_to_delete.append({'Key': obj['Key']})
+            
+            if not objects_to_delete:
+                logger.info("No objects found under prefix: %s", s3_prefix)
+                return {'message': 'No objects found to delete'}
+            
+            # Delete all objects in bulk
+            response = self.s3_client.delete_objects(
+                Bucket=self.bucket_name,
+                Delete={'Objects': objects_to_delete}
+            )
+            
+            logger.info("Successfully deleted %d objects under prefix: %s", 
+                    len(objects_to_delete), s3_prefix)
+            return {
+                'deleted_objects': [obj['Key'] for obj in objects_to_delete],
+                'response': response
+            }
+        except (ClientError, BotoCoreError) as e:
+            logger.error("Deletion failed for prefix: %s - %s", s3_prefix, e, exc_info=True)
+            raise S3OperationError(f"Deletion failed: {e}") from e
     def _download_single_file(self, s3_key: str, local_path: str, overwrite: bool):
         """Download an individual file"""
         dest_dir = os.path.dirname(local_path)
