@@ -565,6 +565,25 @@ class S3Manager:
             })
             raise S3OperationError(f"Download error: {e}") from e
 
+    def delete_file(self, s3_key: str) -> Dict[str, Any]:
+        """
+        Delete a single file/object from S3
+        
+        :param s3_key: Full S3 key/path of the object to delete
+        :return: Response from S3 delete operation
+        :raises S3OperationError: If deletion fails
+        """
+        try:
+            response = self.s3_client.delete_object(
+                Bucket=self.bucket_name,
+                Key=s3_key
+            )
+            logger.info("Successfully deleted: %s", s3_key)
+            return response
+        except (ClientError, BotoCoreError) as e:
+            logger.error("Deletion failed for key: %s - %s", s3_key, e, exc_info=True)
+            raise S3OperationError(f"Deletion failed: {e}") from e
+
     def _download_single_file(self, s3_key: str, local_path: str, overwrite: bool):
         """Download an individual file"""
         dest_dir = os.path.dirname(local_path)
