@@ -90,9 +90,9 @@ class S3Manager:
             raise S3ConfigurationError("Failed to initialize S3 client") from e
 
     def get_total_size(
-        self,
-        prefix: str = ""
-    ) -> int:
+            self,
+            prefix: str = ""
+        ) -> int:
         """
         Calculate the total size of all objects in the bucket or under a specific prefix.
 
@@ -436,6 +436,51 @@ class S3Manager:
         except (ClientError, BotoCoreError) as e:
             logger.error("Upload failed for key: %s - %s", s3_key, e, exc_info=True)
             raise S3OperationError(f"Upload failed: {e}") from e
+
+    def upload_directory(
+        self,
+        directory_path: str,
+        s3_prefix: str,
+        metadata: Optional[Dict[str, str]] = None,
+        content_type: Optional[str] = None,
+        public_read: bool = False
+    ) -> Dict[str, Any]:
+        """
+        Upload a directory to S3 recursively
+        
+        :param directory_path: Path to the local directory to upload
+        :param s3_prefix: S3 prefix (folder) where the directory contents will be uploaded
+        :param metadata: Optional object metadata
+        :param content_type: Content MIME type
+        :param public_read: Enable public read access
+        :return: Dictionary with upload results for each file
+        :raises S3OperationError: If upload fails for any file
+        """
+        upload_results = {}
+        
+        for root, dirs, files in os.walk(directory_path):
+            for file_name in files:
+                local_file_path = os.path.join(root, file_name)
+                
+                # Construct the S3 key by joining the prefix and the relative path
+                relative_path = os.path.relpath(local_file_path, directory_path)
+                s3_key = os.path.join(s3_prefix, relative_path).replace("\\", "/")
+                
+                try:
+                    with open(local_file_path, 'rb') as file_obj:
+                        result = self.upload_fileobj(
+                            file_obj=file_obj,
+                            s3_key=s3_key,
+                            metadata=metadata,
+                            content_type=content_type,
+                            public_read=public_read
+                        )
+                        upload_results[local_file_path] = result
+                except S3OperationError as e:
+                    logger.error("Failed to upload file: %s - %s", local_file_path, e)
+                    upload_results[local_file_path] = {'error': str(e)}
+        
+        return upload_results
 
     def download(
         self,
